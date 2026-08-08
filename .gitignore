@@ -1,0 +1,4 @@
+src/
+*.pat
+.coregram*
+out/

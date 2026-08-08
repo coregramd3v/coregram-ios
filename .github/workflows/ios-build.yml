@@ -1,0 +1,289 @@
+# CoreGram iOS — сборка .ipa на macOS-раннере GitHub Actions.
+#
+# Доведён так, чтобы НЕ падать на первой итерации: исправлены реальные баги скелета
+# (нет checkout своего репо; неверный --configuration; отсутствовал обязательный
+# codesigning-аргумент Make.py; не задавался --outputBuildArtifactsPath; жёсткий pin
+# Xcode 26.2). Сборка БЕЗ аккаунта Apple: --xcodeManagedCodesigning (aps="" проходит
+# проверку Make.py) → неподписанный/adhoc бандл; подпись отдельно (Sideloadly/AltStore).
+#
+# Остаточный риск, который с Linux не проверить (честно): даст ли rules_apple при
+# xcode-managed без залогиненного Apple ID сразу устанавливаемый .ipa, или бандл
+# придётся до-подписать. Поэтому: (а) есть шаг-фоллбэк, который из собранного .app
+# сам пакует неподписанный Payload/*.ipa; (б) логи и артефакты выгружаются ВСЕГДА,
+# чтобы доводку на Mac-стороне делать по данным, а не вслепую.
+
+name: CoreGram iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Сеть: our (наш сервер) или tg (реальный Telegram)"
+        type: choice
+        options: ["our", "tg"]
+        required: true
+        default: "our"
+      tg_ref:
+        description: "Ref Telegram-iOS для клона (тег/ветка/SHA). Пусто = master (форк utonem/mytelegram-iOS (репо коллеги))"
+        required: false
+        default: "master"
+
+concurrency:
+  group: ios-build-${{ github.ref }}-${{ github.event.inputs.variant }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-15 — самый свежий стабильный образ GitHub. Xcode берём фактический
+    # (--overrideXcodeVersion), поэтому pin 26.2 из versions.json не мешает.
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VARIANT: ${{ github.event.inputs.variant }}
+      TG_REF: ${{ github.event.inputs.tg_ref }}
+      ARTIFACTS: build/artifacts        # относительно каталога tg/
+      # Кэш bazel вне tg/, чтобы не чистился при переклонировании.
+      BAZEL_CACHE: ${{ github.workspace }}/telegram-bazel-cache
+
+    steps:
+      - name: Checkout ребренд-репо (rebrand/, appstore-configuration.*.json)
+        uses: actions/checkout@v4
+        # ВАЖНО: без этого шага ../rebrand/* не существует — исходный скелет падал тут.
+
+      - name: Освободить место на диске
+        # Telegram-iOS собирается в десятки ГБ; раннер легко упирается в диск.
+        run: |
+          set -x
+          sudo rm -rf /Applications/Xcode_1[0-5]*.app 2>/dev/null || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          sudo xcrun simctl delete unavailable 2>/dev/null || true
+          df -h /
+
+      - name: Выбрать и проверить Xcode
+        run: |
+          set -e
+          # Берём самый свежий установленный Xcode (не фейлимся на отсутствии 26.2).
+          latest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$latest" ]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
+          echo "Выбран: $(xcode-select -p)"
+          xcodebuild -version || true
+          echo "versions.json проекта требует Xcode 26.2 — переопределяем на фактический через --overrideXcodeVersion."
+
+      - name: Клонировать Telegram-iOS (с сабмодулями)
+        run: |
+          set -e
+          ref="${TG_REF:-master}"
+          echo "Клон utonem/mytelegram-iOS @ $ref (без сабмодулей, потом чиним URL)"
+          rm -rf tg
+          # Топ-репо БЕЗ --recursive: сабмодули utonem указывают на его ПРИВАТНЫЕ форки
+          # (utonem/tgcalls, utonem/rlottie...), CI их не клонит («could not read Username»).
+          if ! git clone --depth 1 --branch "$ref" https://github.com/utonem/mytelegram-iOS.git tg 2>/dev/null; then
+            echo "::warning::shallow по ref '$ref' не вышел — полный клон + checkout."
+            rm -rf tg; git clone https://github.com/utonem/mytelegram-iOS.git tg
+            git -C tg checkout "$ref" || echo "::warning::checkout '$ref' не удался."
+          fi
+          cd tg
+          # Приватные сабмодули utonem (utonem/tgcalls, utonem/rlottie, ...) недоступны CI.
+          # url.insteadOf переписывает ЛЮБОЙ utonem-URL -> публичный loyldg-форк при fetch
+          # сабмодулей (включая вложенные), независимо от формата .gitmodules. Топ-репо уже
+          # склонён из utonem, так что его правки сохранены; SHA сабмодулей совпадают (форк от loyldg).
+          # ВАЖНО: --global. Сабмодульные клоны — отдельные git-процессы, читают global/system
+          # конфиг, а не local конфиг родителя. Ставим ПОСЛЕ клона топ-репо (иначе переписало бы и его).
+          git config --global url."https://github.com/loyldg/".insteadOf "https://github.com/utonem/"
+          git submodule update --init --recursive
+          cd ..
+
+      - name: Подготовить конфигурацию сборки
+        env:
+          COREGRAM_API_ID: ${{ secrets.COREGRAM_API_ID }}
+          COREGRAM_API_HASH: ${{ secrets.COREGRAM_API_HASH }}
+        run: |
+          set -e
+          src="rebrand/appstore-configuration.${VARIANT}.json"
+          dst="tg/build-system/appstore-configuration.json"
+          [ -f "$src" ] || { echo "::error::Нет $src"; exit 1; }
+          cp "$src" "$dst"
+          # tg-вариант требует РЕАЛЬНЫХ api_id/api_hash (my.telegram.org) — подставляем из secrets,
+          # иначе сборка/рантайм гарантированно сломаются. our-вариант оставляем как есть (наш сервер).
+          if [ "$VARIANT" = "tg" ]; then
+            if [ -z "$COREGRAM_API_ID" ] || [ -z "$COREGRAM_API_HASH" ]; then
+              echo "::error::variant=tg требует secrets COREGRAM_API_ID и COREGRAM_API_HASH (my.telegram.org)."
+              exit 1
+            fi
+            tmp="$(mktemp)"
+            jq --arg id "$COREGRAM_API_ID" --arg hash "$COREGRAM_API_HASH" \
+               '.api_id=$id | .api_hash=$hash' "$dst" > "$tmp" && mv "$tmp" "$dst"
+          fi
+          # Неподписанная сборка идёт через build-system/fake-codesigning (готовые профили
+          # в репо Telegram-iOS). Они выписаны на team C67CF9S4VU / bundle ph.telegra.Telegraph,
+          # а Make.py матчит aps-environment по team_id+bundle_id — иначе «no such target
+          # provisioning:Share.mobileprovision» (на этом падал прошлый прогон с xcode-managed).
+          # Поэтому на ВРЕМЯ СБОРКИ выставляем эти значения. При сайдлоаде (Sideloadly/AltStore)
+          # bundle_id и подпись всё равно переписываются под Apple ID пользователя.
+          tmp2="$(mktemp)"
+          jq '.bundle_id="ph.telegra.Telegraph" | .team_id="C67CF9S4VU"' "$dst" > "$tmp2" && mv "$tmp2" "$dst"
+          echo "=== итоговый конфиг (api_hash скрыт) ==="
+          jq '.api_hash="***"' "$dst"
+          jq -e . "$dst" > /dev/null   # валидируем JSON — битый конфиг ловим до 3ч сборки
+
+      - name: Применить ребренд CoreGram
+        run: |
+          set -e
+          cd tg
+          export APP_NAME="CoreGram"
+          if [ "$VARIANT" = "our" ]; then
+            # fail-loud: если якоря сети не совпали — валим сборку, а не шлём молча реальный TG
+            bash "$GITHUB_WORKSPACE/rebrand/apply_our_network.sh"
+          fi
+          # снимаем зависимость от App Group, иначе сайдлоад без entitlement = чёрный экран.
+          # fail-loud: анкор не найден -> сборка падает (лучше, чем чёрный экран на телефоне).
+          bash "$GITHUB_WORKSPACE/rebrand/apply_no_appgroup.sh"
+          # клиентские фичи (все fail-loud). Порядок важен: stealth создаёт
+          # CoreGramStealthMode в TelegramCore, stealth_ui добавляет свитч со ссылкой на него.
+          # подарки: вкладка НАТИВНАЯ (форк, гейт starGiftsCount>0) — форс-патчи не нужны, наш сервер шлёт stargifts_count
+          bash "$GITHUB_WORKSPACE/rebrand/apply_giftref_msgid.sh"   # старые подарки: reference по msg_id (без сброса кэша)
+          bash "$GITHUB_WORKSPACE/rebrand/apply_gift_cache_ios.sh"  # прогрузка NFT: unique:false -> переиспользование кадров
+          bash "$GITHUB_WORKSPACE/rebrand/apply_proxy.sh"           # авто-прокси faketls :443
+          bash "$GITHUB_WORKSPACE/rebrand/apply_stealth.sh"         # Stealth Mode (ядро)
+          bash "$GITHUB_WORKSPACE/rebrand/apply_stealth_ui.sh"      # свитч Stealth в настройках
+          bash "$GITHUB_WORKSPACE/rebrand/apply_buymorestars.sh"    # Buy More Stars -> @coregrbot
+          bash "$GITHUB_WORKSPACE/rebrand/apply_branding.sh" || \
+            echo "::warning::apply_branding.sh не завершился штатно — часть брендинга не применена."
+          bash "$GITHUB_WORKSPACE/rebrand/apply_icon.sh"       # иконка приложения (ava) + имя CoreGram, все размеры (fail-loud)
+
+      - name: Кэш Bazel
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BAZEL_CACHE }}
+          key: bazel-${{ runner.os }}-${{ hashFiles('tg/versions.json') }}-${{ github.event.inputs.variant }}
+          restore-keys: |
+            bazel-${{ runner.os }}-${{ hashFiles('tg/versions.json') }}-
+            bazel-${{ runner.os }}-
+
+      - name: Импорт self-signed сертификата в keychain
+        run: |
+          set -e
+          cd tg
+          # fake-codesigning даёт .mobileprovision, но codesign ищет САМ сертификат в keychain.
+          # Штатный импортёр создаёт temp.keychain и кладёт туда SelfSigned.p12 (пароль пустой)
+          # + AppleWWDRCAG3.cer. Без этого шага bazel падал:
+          # «Unable to find an identity ... matching provisioning/Intents.mobileprovision».
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          echo "=== доступные codesigning-идентичности ==="
+          security find-identity -v -p codesigning || true
+
+      - name: Сборка (Bazel, неподписанная — self-signed для сайдлоада)
+        id: build
+        run: |
+          set -o pipefail
+          cd tg
+          mkdir -p "$ARTIFACTS"
+          # Ключевые правки против скелета:
+          #  --overrideXcodeVersion / --overrideBazelVersion — не падать на pin версий;
+          #  --configuration=release_arm64 — валидный выбор (release_universal НЕ существует);
+          #  --codesigningInformationPath=build-system/fake-codesigning — готовые fake-профили
+          #    из репо: удовлетворяют обязательный codesigning-аргумент И кладут .mobileprovision
+          #    в пакет provisioning (расширения ShareExtension и т.п. их требуют). Даёт
+          #    self-signed .ipa — под сайдлоад его переподписывают. (xcode-managed падал:
+          #    не клал профили → «no such target provisioning:Share.mobileprovision».)
+          #  --outputBuildArtifactsPath — без него Telegram.ipa не собирается в артефакты.
+          set +e
+          python3 build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --overrideBazelVersion \
+            --cacheDir="$BAZEL_CACHE" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --buildNumber="$(date -u +%s)" \
+            --configuration=release_arm64 \
+            --codesigningInformationPath="build-system/fake-codesigning" \
+            --outputBuildArtifactsPath="$ARTIFACTS" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "build_rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Make.py вернул $rc — пробуем фоллбэк-упаковку из .app, логи выгрузим в любом случае."
+          fi
+          exit 0   # не роняем job: даём отработать фоллбэку и выгрузке логов
+
+      - name: Фоллбэк-упаковка .ipa из .app (если Make.py не отдал ipa)
+        id: repack
+        run: |
+          set -e
+          cd tg
+          found_ipa="$(ls "$ARTIFACTS"/Telegram.ipa 2>/dev/null || true)"
+          if [ -n "$found_ipa" ]; then
+            echo "Make.py собрал: $found_ipa"; echo "ipa=$found_ipa" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "Telegram.ipa не найден — ищем собранный .ipa/.app в дереве bazel."
+          any_ipa="$(find bazel-bin bazel-out . -name '*.ipa' 2>/dev/null | head -1 || true)"
+          if [ -n "$any_ipa" ]; then
+            cp "$any_ipa" "$ARTIFACTS/Telegram.ipa"
+            echo "Скопирован найденный ipa: $any_ipa"; echo "ipa=$ARTIFACTS/Telegram.ipa" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          app="$(find bazel-bin bazel-out . -maxdepth 6 -name 'Telegram.app' -type d 2>/dev/null | head -1 || true)"
+          [ -z "$app" ] && app="$(find bazel-bin bazel-out . -maxdepth 6 -name '*.app' -type d 2>/dev/null | head -1 || true)"
+          if [ -n "$app" ]; then
+            echo "Найден .app: $app — пакуем неподписанный Payload/*.ipa"
+            work="$(mktemp -d)"; mkdir -p "$work/Payload"
+            cp -R "$app" "$work/Payload/"
+            ( cd "$work" && zip -qry "$OLDPWD/$ARTIFACTS/CoreGram-unsigned.ipa" Payload )
+            echo "Готов неподписанный: $ARTIFACTS/CoreGram-unsigned.ipa (подписать через Sideloadly/AltStore)"
+            echo "ipa=$ARTIFACTS/CoreGram-unsigned.ipa" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Ни .ipa, ни .app не найдены — смотри build.log в артефактах, доводить на Mac."
+          fi
+
+      - name: Проверка имени приложения в собранном IPA (гейт)
+        run: |
+          set -e
+          shopt -s nullglob
+          ipas=(tg/build/artifacts/*.ipa)
+          if [ ${#ipas[@]} -eq 0 ]; then
+            echo "::error::IPA не собран — нечего проверять (см. build.log)."
+            exit 1
+          fi
+          ipa="${ipas[0]}"
+          echo "Проверяю имя приложения в $ipa"
+          work="$(mktemp -d)"
+          unzip -qo "$ipa" -d "$work"
+          plist="$(ls "$work"/Payload/*.app/Info.plist | head -1)"
+          [ -f "$plist" ] || { echo "::error::В IPA нет Payload/*.app/Info.plist"; exit 1; }
+          dn="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$plist" 2>/dev/null || echo '')"
+          bn="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist" 2>/dev/null || echo '')"
+          bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null || echo '')"
+          echo "CFBundleDisplayName=$dn | CFBundleName=$bn | CFBundleIdentifier=$bid"
+          if [ "$dn" != "CoreGram" ] || [ "$bn" != "CoreGram" ]; then
+            echo "::error::Ребрендинг НЕ применился: DisplayName='$dn' Name='$bn' (ожидалось CoreGram). Сборка провалена намеренно."
+            exit 1
+          fi
+          echo "✅ Имя приложения = CoreGram (DisplayName и Name)."
+
+      - name: Выгрузить .ipa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coregram-ios-${{ github.event.inputs.variant }}
+          path: |
+            tg/build/artifacts/*.ipa
+            tg/build/artifacts/*.zip
+          if-no-files-found: warn
+
+      - name: Выгрузить логи сборки (всегда — для доводки)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.event.inputs.variant }}
+          path: |
+            build.log
+          if-no-files-found: warn
+
+      - name: Итог
+        if: always()
+        run: |
+          if ls tg/build/artifacts/*.ipa >/dev/null 2>&1; then
+            echo "✅ IPA собран: $(ls tg/build/artifacts/*.ipa). Подпись — Sideloadly/AltStore (free ID = 7 дней, \$99 = год)."
+          else
+            echo "⚠️ IPA не собран за эту итерацию. build.log выгружен — доводить на Mac (Bazel/provisioning/версия Xcode). Это ожидаемо для Telegram-iOS."
+          fi
