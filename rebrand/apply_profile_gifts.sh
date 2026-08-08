@@ -25,9 +25,9 @@
 # context exists, independent of cachedData load state.
 #
 # For isMyProfile specifically: availablePanes starts [] (peerInfoAvailableMediaPanes
-# uses empty tags for isMyProfile), line 1548 inserts .stories -> [.stories],
+# uses empty tags for isMyProfile), line 1519 (layer227) inserts .stories -> [.stories],
 # Edit A inserts .gifts (profileGiftsContext is non-nil because isMyProfile takes
-# the `if` branch at 1186 that always creates it) -> [.stories, .gifts]. Edit C
+# the `if` branch at 1159 that always creates it) -> [.stories, .gifts]. Edit C
 # then no-ops (already contains .gifts). data.availablePanes = [.stories, .gifts]
 # -> strip renders. The gifts pane force-unwraps data.profileGiftsContext! AND
 # data.profileGiftsCollectionsContext! (PeerInfoPaneContainerNode.swift:470), both
@@ -39,7 +39,7 @@
 # Root cause (client-side), in
 #   submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoData.swift
 # For the `.user` kind:
-#   * Gifts context creation (~line 1186):
+#   * Gifts context creation (~line 1159 on layer227):
 #       if isMyProfile || userPeerId != context.account.peerId {
 #           profileGiftsContext = ... ProfileGiftsContext(...)
 #       } else {
@@ -47,10 +47,10 @@
 #       }
 #     When the own profile is reached with isMyProfile == false (userPeerId ==
 #     account.peerId), profileGiftsContext becomes nil.
-#   * The own-profile (isMyProfile) insert (~1549) is gated on
+#   * The own-profile (isMyProfile) insert (~1520 on layer227) is gated on
 #     `profileGiftsContext != nil` (and, stock, `starGiftsCount > 0`), so with a
 #     nil context / nil count it is skipped.
-#   * The other-user insert (~1562) is guarded by `peerView.peerId !=
+#   * The other-user insert (~1533 on layer227) is guarded by `peerView.peerId !=
 #     context.account.peerId`, so SELF is deliberately excluded there.
 #   Net: for the own profile, no branch ever inserts `.gifts`, and since the
 #   whole pane bar is hidden when availablePanes is empty (PeerInfoScreen.swift
@@ -128,7 +128,7 @@ if [ "$A_CNT" != "1" ]; then echo "ERROR: Edit A anchor (own-profile insert) mat
 if [ "$B_CNT" != "1" ]; then echo "ERROR: Edit B anchor (gifts-context else) matched $B_CNT (expected 1)." >&2; exit 1; fi
 if [ "$C_CNT" != "1" ]; then echo "ERROR: Edit C anchor (mainProfileTab reorder) matched $C_CNT (expected 1)." >&2; exit 1; fi
 
-echo "=== BEFORE (context creation ~1186) ==="
+echo "=== BEFORE (context creation ~1159 on layer227) ==="
 grep -n -A11 "if isMyProfile || userPeerId != context.account.peerId {" "$TARGET" | head -13
 
 # --- Edit A: own-profile insert -- drop starGiftsCount gate -----------------

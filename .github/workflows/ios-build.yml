@@ -140,7 +140,7 @@ jobs:
           bash "$GITHUB_WORKSPACE/rebrand/apply_no_appgroup.sh"
           # клиентские фичи (все fail-loud). Порядок важен: stealth создаёт
           # CoreGramStealthMode в TelegramCore, stealth_ui добавляет свитч со ссылкой на него.
-          # подарки: вкладка НАТИВНАЯ (форк, гейт starGiftsCount>0) — форс-патчи не нужны, наш сервер шлёт stargifts_count
+          bash "$GITHUB_WORKSPACE/rebrand/apply_profile_gifts.sh"   # подарки: ГАРАНТ-вкладка .gifts на своём профиле (форк layer227 native tab не рендерит сам)
           bash "$GITHUB_WORKSPACE/rebrand/apply_giftref_msgid.sh"   # старые подарки: reference по msg_id (без сброса кэша)
           bash "$GITHUB_WORKSPACE/rebrand/apply_gift_cache_ios.sh"  # прогрузка NFT: unique:false -> переиспользование кадров
           bash "$GITHUB_WORKSPACE/rebrand/apply_proxy.sh"           # авто-прокси faketls :443
