@@ -129,6 +129,14 @@ replacement = """    case .twoStepAuthMissing:
         return confirmStarsRevenueWithdrawalController(context: context, updatedPresentationData: updatedPresentationData, peerId: peerId, amount: amount, present: present, completion: completion)
 """
 ui = ui[:start] + replacement + ui[end:]
+
+# Вырезанная ветка была единственным местом, где менялся actions: без неё
+# Swift ругается «never mutated», а сборка идёт с warning-as-error и падает.
+mutable = "    var actions: [AlertScreen.Action] = ["
+if ui.count(mutable) != 1:
+    raise SystemExit("ERROR: объявление actions найдено %d раз" % ui.count(mutable))
+ui = ui.replace(mutable, "    let actions: [AlertScreen.Action] = [", 1)
+
 open(ui_path, 'w', encoding='utf-8').write(ui)
 PY
 
