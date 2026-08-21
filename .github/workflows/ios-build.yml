@@ -147,6 +147,8 @@ jobs:
           bash "$GITHUB_WORKSPACE/rebrand/apply_stealth.sh"         # Stealth Mode (ядро)
           bash "$GITHUB_WORKSPACE/rebrand/apply_stealth_ui.sh"      # свитч Stealth в настройках
           bash "$GITHUB_WORKSPACE/rebrand/apply_buymorestars.sh"    # Buy More Stars -> @coregrbot
+          bash "$GITHUB_WORKSPACE/rebrand/apply_stars_withdraw_no2fa.sh"  # вывод звёзд канала без 2FA
+          bash "$GITHUB_WORKSPACE/rebrand/apply_wallet_gift_links.sh"   # подарок на кошельке: ссылки на наш кошелёк вместо fragment.com
           bash "$GITHUB_WORKSPACE/rebrand/apply_branding.sh" || \
             echo "::warning::apply_branding.sh не завершился штатно — часть брендинга не применена."
           bash "$GITHUB_WORKSPACE/rebrand/apply_icon.sh"       # иконка приложения (ava) + имя CoreGram, все размеры (fail-loud)
