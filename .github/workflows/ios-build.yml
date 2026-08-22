@@ -24,7 +24,7 @@ on:
         required: true
         default: "our"
       tg_ref:
-        description: "Ref Telegram-iOS для клона (тег/ветка/SHA). Пусто = master (форк utonem/mytelegram-iOS (репо коллеги))"
+        description: "Ref Telegram-iOS для клона (тег/ветка/SHA). Пусто = master (форк loyldg/mytelegram-iOS (кастом-серверный, вход работает))"
         required: false
         default: "master"
 
@@ -77,9 +77,9 @@ jobs:
           rm -rf tg
           # Топ-репо БЕЗ --recursive: сабмодули utonem указывают на его ПРИВАТНЫЕ форки
           # (utonem/tgcalls, utonem/rlottie...), CI их не клонит («could not read Username»).
-          if ! git clone --depth 1 --branch "$ref" https://github.com/utonem/mytelegram-iOS.git tg 2>/dev/null; then
+          if ! git clone --depth 1 --branch "$ref" https://github.com/loyldg/mytelegram-iOS.git tg 2>/dev/null; then
             echo "::warning::shallow по ref '$ref' не вышел — полный клон + checkout."
-            rm -rf tg; git clone https://github.com/utonem/mytelegram-iOS.git tg
+            rm -rf tg; git clone https://github.com/loyldg/mytelegram-iOS.git tg
             git -C tg checkout "$ref" || echo "::warning::checkout '$ref' не удался."
           fi
           cd tg
